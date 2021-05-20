@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+
+# https://github.com/helloSystem/Menu/issues/23
+
+
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QHBoxLayout, QGroupBox, QSlider, QWidget, \
+    QActionGroup, QDesktopWidget, QMessageBox, QInputDialog, QLineEdit
+from PyQt5.QtGui import QIcon, QPixmap
+from PyQt5.QtCore import Qt, QProcess, QMetaObject, QCoreApplication, QEvent, QObject, QTimer
+from subprocess import Popen, check_output
+import sys, os, re, subprocess
+
+
+class NetworkMenu(QObject):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.showTODO("It can show wireless networks but not connect to them. Do you know how to fix this?")
+
+        icon = QIcon(os.path.dirname(os.path.abspath(__file__)) + "/Resources/Network.png") # FIXME: How to get dark rather than bright icon?
+        # TODO: Change the icon depending on signal strength; see /usr/local/share/icons/elementary-xfce/status/symbolic/network-wireless-*
+        self.tray = QSystemTrayIcon()
+        self.tray.setIcon(icon)
+        self.tray.setVisible(True)
+        self.menu = QMenu()
+
+        self.tray.setContextMenu(self.menu)
+
+        # NOTE:
+        # https://forum.learnpyqt.com/t/qsystemtrayicon-example/689
+        # Sneaky PyQt quirk! A reference to the actions must be kept around or the actions will be destroyed
+        self.actions = []
+        self.sliderWindow = None
+
+        self.refreshMenu() # Initially populate the menu
+        self.tray.installEventFilter(self) # FIXME: This never seems to get called, why?
+        self.installEventFilter(self)  # FIXME: This never seems to get called, why?
+
+    def eventFilter(self, obj, event):
+        print("eventFilter function running") # FIXME: Why is this never called when the icon is right-clicked?
+        # We need to refresh the contents of the right-click menu somehow when the user right-clicks...
+
+    def onClicked(self, reason):
+        self.refreshMenu()
+        S = Ui_Slider()
+        self.sliderWindow = S # Need to keep a reference around so that it does not get destroyed
+        S.show()
+
+    def refreshMenu(self):
+        self.actions = []
+        self.menu.clear()
+        # Get the sound devices from
+        # cat /dev/sndstat
+        p = QProcess()
+        p.setProgram("wpa_cli")
+
+        # First, scan
+        p.setArguments(["scan"])
+        print(p.program() + " " + " ".join(p.arguments()))
+        p.start()
+        p.waitForFinished()
+
+        # Second, show
+        p.setArguments(["scan_results"])
+        print(p.program() + " " + " ".join(p.arguments()))
+        p.start()
+        p.waitForFinished()
+
+        lines = str(p.readAllStandardOutput(), 'utf-8').strip().split("\n")
+
+        self.wirelessGroup = QActionGroup(self.menu) # Only one of the actions added to this group can be active
+
+        action = QAction("Wireless")
+        action.setDisabled(True)
+        self.actions.append(action)
+        self.menu.addAction(action)
+        # TODO: List the different wireless interfaces with `wpa_cli interface` if there is more than one
+        # TODO: Allow to open a hotspot
+
+        if len(lines) > 1:
+
+            for line in lines:
+                if line.startswith("Selected") or line.startswith("bssid"):
+                    continue
+                print(line)
+                # Parse out information for each network
+                bssid = line[0:17].strip()
+                signal_level = int(line[23:26].strip())
+                label = line[26:].strip() # Remove first 26 characers (bssid / frequency / signal level)
+                # Remove flags
+                label = re.sub(r'\[.*?\]', '', label).strip()
+                ssid = label
+                if label == "":
+                    label = bssid # For networks with hidden ssid (network name)
+                action = QAction(line)
+                action.__setattr__("ssid", ssid)
+                action.__setattr__("bssid", bssid)
+                action.triggered.connect(self.switchNetwork)  # lambda could be used to pass an argument but the argument passed is taken at the time when this executes, which is not what we want
+                action.setText(label)
+                action.setIcon(QIcon.fromTheme("network-wireless-symbolic"))
+                # TODO: Set different icons based on signal_level
+                action.setCheckable(True)
+                if "default" in line:
+                    action.setChecked(True)
+                self.actions.append(action)
+                self.wirelessGroup.addAction(action)
+                self.menu.addAction(action)
+
+        self.menu.addSeparator()
+
+        action = QAction("Rescan Networks")
+        # action.setDisabled(True)
+        action.triggered.connect(self.refreshMenu)
+        self.actions.append(action)
+        self.menu.addAction(action)
+
+        action = QAction("Create Hotspot...") # TODO: To be implemented
+        action.setDisabled(True)
+        self.actions.append(action)
+        self.menu.addAction(action)
+
+        action = QAction("Switch Off") # TODO: To be implemented
+        action.setDisabled(True)
+        self.actions.append(action)
+        self.menu.addAction(action)
+
+        self.menu.addSeparator()
+
+        action = QAction("About")
+        action.triggered.connect(self._showAbout)
+        self.actions.append(action)
+        self.menu.addAction(action)
+
+    def switchNetwork(self, line):
+        # sysctl hw.snd.default_unit=1 switches to pcm1
+        ssid = getattr(self.wirelessGroup.checkedAction(), "ssid")
+        bssid = getattr(self.wirelessGroup.checkedAction(), "bssid")
+
+        password, ok = QInputDialog.getText(None, "WiFi password", "Please enter\
+ the password for the %s WiFi network:" % ssid if ssid else bssid,
+            QLineEdit.Password) # TODO: Make OK only clickable when we have >= 8 characters
+        if not ok:
+            print("DEBUG:: psk cancelled")
+            return # Don't try to connect to a network if it has been cancelled.
+
+        # Get a byte string with wpa_cli's output and decode it
+        p = QProcess()
+        p.setProgram("wpa_cli")
+
+        # First, scan
+        p.setArguments(["list_networks"])
+        print(p.program() + " " + " ".join(p.arguments()))
+        p.start()
+        p.waitForFinished()
+        output = str(p.readAllStandardOutput(), 'utf-8')
+        l = output.strip().splitlines() # Split that output into lines, ignoring the
+        if len(l) < 2:                  # useless ones.
+            # If this is called, something is wrong with wpa_cli.
+            self.showError("Couldn't connect to the network", """For some reaso\
+n wpa_cli doesn't seem to be working.
+
+Information for debuggers:
+""" + o.strip())
+            return
+        isUsed = 0
+        for line in l[2:]: # Ignore 'selected interface' message and column labels
+            parts = line.split()
+            if parts[1] in [ssid, bssid]:
+                isUsed = 1
+                n = parts[0]
+
+        if isUsed: # TODO: We know we've already connected -- check why we are re-connecting
+            p.setArguments(["set_network", str(n), "psk", '"' + password + '"'])
+            print(p.program() + " " + " ".join(p.arguments()))
+            p.start()
+            p.waitForFinished()
+            if b"OK" in str(p.readAllStandardOutput(), 'utf-8'):
+                return # good
+            else:
+                self.showError("Couldn't connect to the network. Try checking the password?",
+                               """Information for debuggers:
+""" + out.decode('utf-8'))
+                return # bad
+        else:
+            p.setArguments(["add_network"])
+            print(p.program() + " " + " ".join(p.arguments()))
+            p.start()
+            p.waitForFinished()
+            e = str(p.readAllStandardOutput(), 'utf-8').strip().splitlines()[-1]
+            if not e.isnumeric():
+                self.showError("Couldn't connect to the network.", "'%s' is not a number." % e)
+                print("'%s' is not a number." % e)
+                return # bad
+            try:
+                n = int(e)
+            except:
+                self.showError("Couldn't connect to the network.", "\
+We don't know why this happened.")
+                print("returned non-zero exit code")
+                return # bad
+            p.setArguments(["set_network", str(n), "ssid" if ssid else "bssid", '"' + (ssid if ssid else bssid) + '"'])
+            print(p.program() + " " + " ".join(p.arguments()))
+            p.start()
+            p.waitForFinished()
+            out = str(p.readAllStandardOutput(), 'utf-8')
+            if "OK" not in out:
+                self.showError("Couldn't connect to the network.",
+                               """Information for debuggers:
+""" + out)
+                return # bad
+            p.setArguments(["set_network", str(n), "psk", '"' + password + '"'])
+            print(p.program() + " " + " ".join(p.arguments()))
+            p.start()
+            p.waitForFinished()
+            out = str(p.readAllStandardOutput(), 'utf-8')
+            if "OK" not in out:
+                self.showError("Couldn't connect to the network. Try checking the password?",
+                               """Information for debuggers:
+""" + out)
+                return # not good
+            p.setArguments(["enable_network", str(n)])
+            print(p.program() + " " + " ".join(p.arguments()))
+            p.start()
+            p.waitForFinished()
+            lastout = str(p.readAllStandardOutput(), 'utf-8')
+            if "OK" in lastout:
+                p.setArguments(["save_config"])
+                print(p.program() + " " + " ".join(p.arguments()))
+                p.start()
+                p.waitForFinished()
+                return # good
+            else:
+                self.showError("Couldn't connect to the network. Try checking the password?",
+                               """Information for debuggers:
+""" + lastout)
+                return # not good
+
+    def _showAbout(self):
+        print("showDialog")
+        msg = QMessageBox()
+        msg.setWindowTitle("Network")
+        msg.setIconPixmap(QPixmap(os.path.dirname(__file__) + "/Resources/Network.png").scaledToWidth(64, Qt.SmoothTransformation))
+        candidates = ["COPYRIGHT", "COPYING", "LICENSE"]
+        for candidate in candidates:
+            if os.path.exists(os.path.dirname(__file__) + "/" + candidate):
+                with open(os.path.dirname(__file__) + "/" + candidate, 'r') as file:
+                    data = file.read()
+                msg.setDetailedText(data)
+        msg.setText("<h3>Network</h3>")
+        msg.setInformativeText("A simple QSystemTrayIcon application to select the wireless network using <a href='https://www.freebsd.org/cgi/man.cgi?wpa_cli'>wpa_cli</a><br><br><a href='https://github.com/helloSystem/Utilities'>https://github.com/helloSystem/Utilities</a>")
+        msg.exec()
+
+    def showError(self, text, detailed_text=""):
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Critical)
+        msg.setWindowTitle("Error")
+        msg.setText(text)
+        if detailed_text != "":
+            msg.setDetailedText(detailed_text)
+        msg.exec()
+
+    def showTODO(self, detailed_text=""):
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Developer Preview")
+        msg.setText("This application is a preview for developers.<br>It is not fully functional yet.")
+        msg.setDetailedText("Please see https://github.com/helloSystem/Utilities if you would like to contribute.\n\n" + detailed_text)
+        msg.exec()
+
+if __name__ == "__main__":
+
+    # Simple singleton:
+    # Ensure that only one instance of this application is running by trying to kill the other ones
+    p = QProcess()
+    p.setProgram("pkill")
+    p.setArguments(["-f", os.path.abspath(__file__)])
+    cmd = p.program() + " " + " ".join(p.arguments())
+    print(cmd)
+    p.start()
+    p.waitForFinished()
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    NM = NetworkMenu()
+    sys.exit(app.exec_())
